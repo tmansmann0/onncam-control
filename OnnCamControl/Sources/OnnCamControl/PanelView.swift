@@ -91,9 +91,15 @@ struct PanelView: View {
     }
 
     private var footer: some View {
-        HStack {
-            presetsMenu
+        HStack(spacing: 10) {
+            Toggle("Start at login", isOn: Binding(
+                get: { model.launchAtLogin },
+                set: { model.setLaunchAtLogin($0) }
+            ))
+            .toggleStyle(.checkbox)
+            .font(.system(size: 11))
             Spacer()
+            presetsMenu
             Button("Refresh") { Task { await model.refresh() } }
             Button("Quit") { NSApplication.shared.terminate(nil) }
         }
@@ -182,8 +188,12 @@ struct PanelView: View {
                 control: model.control("focus"),
                 disabled: (model.control("focus-auto")?.current ?? 0) != 0
             ) { model.setControl("focus", to: $0) }
-            // Note: the camera also reports a zoom control, but the firmware
-            // only stores the value; the ISP ignores it. Not exposed.
+            if model.zoomAvailable {
+                ControlSliderRow(control: model.control("zoom")) { model.setControl("zoom", to: $0) }
+                Text("Zoom is an ISP crop; it only applies at 1280x720 and below.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
         }
     }
 

@@ -93,6 +93,14 @@ final class CameraViewModel: ObservableObject {
         controls[name]
     }
 
+    /// The ISP only applies zoom (a sensor crop) on streams of 1280x1024 and
+    /// below; at 1920x1080+ the value is stored but has no visible effect.
+    var zoomAvailable: Bool {
+        guard let id = activeFormatID,
+              let format = formats.first(where: { $0.id == id }) else { return false }
+        return format.width <= 1280
+    }
+
     // MARK: - Refresh
 
     func refresh() async {
@@ -204,7 +212,7 @@ final class CameraViewModel: ObservableObject {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let values = Dictionary(uniqueKeysWithValues: controls.values
-            .filter { $0.settable && $0.name != "zoom" }
+            .filter { $0.settable }
             .map { ($0.name, $0.current) })
         presetStore.save(UserPreset(name: trimmed, values: values, createdAt: Date()))
         userPresets = presetStore.load()
@@ -235,7 +243,7 @@ final class CameraViewModel: ObservableObject {
             for name in modeControlNames {
                 if let value = values[name] { ordered.append((name, value)) }
             }
-            for (name, value) in values.sorted(by: { $0.key < $1.key }) where !modeControlNames.contains(name) && name != "zoom" {
+            for (name, value) in values.sorted(by: { $0.key < $1.key }) where !modeControlNames.contains(name) {
                 ordered.append((name, value))
             }
 
@@ -498,7 +506,9 @@ final class PreviewSessionController: @unchecked Sendable {
 
         let input = try AVCaptureDeviceInput(device: camera)
         session.beginConfiguration()
-        session.sessionPreset = .vga640x480
+        // 720p or higher: the camera's ISP zoom (and crop-based controls)
+        // don't visibly apply to the low-res VGA stream.
+        session.sessionPreset = .hd1280x720
         if session.canAddInput(input) {
             session.addInput(input)
         }
