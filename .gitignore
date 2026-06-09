@@ -1,0 +1,14 @@
+.DS_Store
+.build/
+dist/
+*.app/
+*.dmg
+*.xcuserdata/
+DerivedData/
+
+# Local editor files
+.vscode/
+.idea/
+
+# Built helper binary
+onncam/onncam
