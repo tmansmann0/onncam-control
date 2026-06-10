@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import ServiceManagement
+import Vision
 
 struct CameraControl: Hashable, Sendable {
     let name: String
@@ -55,6 +56,8 @@ private let controlLabels: [String: String] = [
     "focus": "Focus",
     "focus-auto": "Autofocus",
     "zoom": "Zoom",
+    "pan": "Pan",
+    "tilt": "Tilt",
     "backlight": "Backlight",
     "brightness": "Brightness",
     "contrast": "Contrast",
@@ -81,6 +84,7 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var status = "Connecting…"
     @Published private(set) var cameraFound = false
     @Published private(set) var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published private(set) var faceTrackingEnabled = false
 
     let previewController = PreviewSessionController()
 
@@ -88,6 +92,15 @@ final class CameraViewModel: ObservableObject {
     private let presetStore = UserPresetStore()
     private var pendingSets: [String: Int] = [:]
     private var drainTask: Task<Void, Never>?
+    /// Manual drags win over face tracking for a moment so the two don't
+    /// fight for the crop window.
+    private var lastManualPanTilt = Date.distantPast
+
+    init() {
+        previewController.onFace = { [weak self] center in
+            self?.handleFace(center)
+        }
+    }
 
     func control(_ name: String) -> CameraControl? {
         controls[name]
@@ -99,6 +112,98 @@ final class CameraViewModel: ObservableObject {
         guard let id = activeFormatID,
               let format = formats.first(where: { $0.id == id }) else { return false }
         return format.width <= 1280
+    }
+
+    /// Pan/tilt shift the ISP crop window around the sensor, so they only
+    /// have a visible effect while zoomed in.
+    var panTiltAvailable: Bool {
+        zoomAvailable
+            && (control("zoom")?.current ?? 0) > 0
+            && control("pan") != nil
+            && control("tilt") != nil
+    }
+
+    /// Moves the crop window by a delta in hardware units (the device steps
+    /// in increments of 3600). Used by the preview drag gesture.
+    func nudgePanTilt(panDelta: Int, tiltDelta: Int) {
+        lastManualPanTilt = Date()
+        nudge("pan", by: panDelta)
+        nudge("tilt", by: tiltDelta)
+    }
+
+    func centerPanTilt() {
+        for name in ["pan", "tilt"] where (control(name)?.current ?? 0) != 0 {
+            setControl(name, to: 0)
+        }
+    }
+
+    private func nudge(_ name: String, by delta: Int) {
+        guard delta != 0, let control = controls[name],
+              let minValue = control.min, let maxValue = control.max else { return }
+        setControl(name, to: min(max(control.current + delta, minValue), maxValue))
+    }
+
+    // MARK: - Face tracking
+
+    private var faceError: CGPoint?
+    private var trackingDriveTask: Task<Void, Never>?
+
+    func setFaceTracking(_ enabled: Bool) {
+        faceTrackingEnabled = enabled
+        previewController.setFaceTracking(enabled)
+        trackingDriveTask?.cancel()
+        trackingDriveTask = nil
+        faceError = nil
+        if enabled {
+            trackingDriveTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 33_000_000)
+                    self?.driveTowardFace()
+                }
+            }
+        }
+    }
+
+    /// Latest detection result (normalized Vision coordinates, origin
+    /// bottom-left), low-pass filtered to absorb frame-to-frame jitter.
+    private func handleFace(_ center: CGPoint?) {
+        guard faceTrackingEnabled, let center else {
+            faceError = nil
+            return
+        }
+        let raw = CGPoint(x: center.x - 0.5, y: center.y - 0.5)
+        if let previous = faceError {
+            faceError = CGPoint(x: previous.x * 0.6 + raw.x * 0.4,
+                                y: previous.y * 0.6 + raw.y * 0.4)
+        } else {
+            faceError = raw
+        }
+    }
+
+    /// 30 Hz ease-out drive: pan/tilt velocity is proportional to how far
+    /// off-center the face is, so the crop glides toward the face and
+    /// settles instead of stepping. The hardware accepts arbitrary values
+    /// despite advertising a step of 3600.
+    private func driveTowardFace() {
+        guard faceTrackingEnabled, panTiltAvailable, let error = faceError else { return }
+        guard Date().timeIntervalSince(lastManualPanTilt) > 1.5 else { return }
+
+        let deadband = 0.04
+        let maxSpeed = 28000.0 // hardware units per second at full error
+        let tick = 0.033
+
+        func delta(_ e: Double) -> Int {
+            guard abs(e) > deadband else { return 0 }
+            let speed = max(-maxSpeed, min(maxSpeed, e * 2.2 * maxSpeed))
+            return Int(speed * tick)
+        }
+
+        let panDelta = delta(error.x)
+        // Hardware tilt is positive-down, opposite of Vision's bottom-left
+        // origin, hence the negation.
+        let tiltDelta = -delta(error.y)
+        if panDelta != 0 { nudge("pan", by: panDelta) }
+        if tiltDelta != 0 { nudge("tilt", by: tiltDelta) }
     }
 
     // MARK: - Refresh
@@ -153,6 +258,15 @@ final class CameraViewModel: ObservableObject {
         pendingSets[name] = value
         if drainTask == nil {
             drainTask = Task { await drainPendingSets() }
+        }
+
+        // Zooming all the way out leaves a stale crop offset behind;
+        // recenter so the next zoom-in starts framed on the sensor middle.
+        if name == "zoom" && value == 0 {
+            centerPanTilt()
+            if faceTrackingEnabled {
+                setFaceTracking(false)
+            }
         }
     }
 
@@ -472,31 +586,60 @@ final class UserPresetStore: @unchecked Sendable {
 
 // MARK: - Preview session
 
-final class PreviewSessionController: @unchecked Sendable {
+final class PreviewSessionController: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "OnnCamControl.PreviewSession")
+    private let videoQueue = DispatchQueue(label: "OnnCamControl.PreviewFrames")
     private var configured = false
+
+    /// Session-state inputs; mutated on sessionQueue only.
+    private var panelVisible = false
+    private var trackingActive = false
+
+    /// Latest face center in normalized Vision coordinates (origin
+    /// bottom-left), nil when no face is found. Delivered on the main actor.
+    var onFace: (@MainActor @Sendable (CGPoint?) -> Void)?
+
+    /// Written on sessionQueue, read on videoQueue; Bool tearing is benign.
+    private var detectFaces = false
+    private var lastDetection = Date.distantPast
+    private let faceDetector = FaceDetector()
 
     func start() {
         sessionQueue.async { [weak self] in
-            guard let self else { return }
-            do {
-                try self.configureIfNeeded()
-                if !self.session.isRunning {
-                    self.session.startRunning()
-                }
-            } catch {
-                // Keep the panel usable even if preview access is unavailable.
-            }
+            self?.panelVisible = true
+            self?.applySessionState()
         }
     }
 
     func stop() {
         sessionQueue.async { [weak self] in
-            guard let self else { return }
-            if self.session.isRunning {
-                self.session.stopRunning()
-            }
+            self?.panelVisible = false
+            self?.applySessionState()
+        }
+    }
+
+    /// Face tracking needs frames even while the panel is closed, so it
+    /// holds the session open independently of panel visibility.
+    func setFaceTracking(_ enabled: Bool) {
+        sessionQueue.async { [weak self] in
+            self?.trackingActive = enabled
+            self?.detectFaces = enabled
+            self?.applySessionState()
+        }
+    }
+
+    private func applySessionState() {
+        do {
+            try configureIfNeeded()
+        } catch {
+            return // Keep the panel usable even if preview access is unavailable.
+        }
+        let shouldRun = panelVisible || trackingActive
+        if shouldRun && !session.isRunning {
+            session.startRunning()
+        } else if !shouldRun && session.isRunning {
+            session.stopRunning()
         }
     }
 
@@ -512,7 +655,43 @@ final class PreviewSessionController: @unchecked Sendable {
         if session.canAddInput(input) {
             session.addInput(input)
         }
+        let output = AVCaptureVideoDataOutput()
+        output.alwaysDiscardsLateVideoFrames = true
+        output.setSampleBufferDelegate(self, queue: videoQueue)
+        if session.canAddOutput(output) {
+            session.addOutput(output)
+        }
         session.commitConfiguration()
         configured = true
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        guard detectFaces, let onFace else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastDetection) >= 0.15 else { return }
+        lastDetection = now
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let center = faceDetector.largestFaceCenter(in: pixelBuffer)
+        Task { @MainActor in
+            onFace(center)
+        }
+    }
+}
+
+/// Vision face detection, run synchronously on the video frame queue at the
+/// throttled detection rate.
+private final class FaceDetector: @unchecked Sendable {
+    private let request = VNDetectFaceRectanglesRequest()
+
+    func largestFaceCenter(in buffer: CVPixelBuffer) -> CGPoint? {
+        let handler = VNImageRequestHandler(cvPixelBuffer: buffer, options: [:])
+        guard (try? handler.perform([request])) != nil,
+              let face = request.results?.max(by: {
+                  $0.boundingBox.width * $0.boundingBox.height <
+                      $1.boundingBox.width * $1.boundingBox.height
+              })
+        else { return nil }
+        return CGPoint(x: face.boundingBox.midX, y: face.boundingBox.midY)
     }
 }

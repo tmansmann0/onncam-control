@@ -11,9 +11,18 @@ struct PanelView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            CameraPreviewView(controller: model.previewController)
-                .frame(height: panelHeight < 600 ? 150 : 196)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+            CameraPreviewView(
+                controller: model.previewController,
+                panTiltEnabled: model.panTiltAvailable,
+                // The camera advertises step=3600 but accepts arbitrary
+                // values, so drags emit fine-grained quanta for smoothness.
+                panQuantum: 150,
+                panSpan: panTiltSpan,
+                onPanTiltDelta: { pan, tilt in model.nudgePanTilt(panDelta: pan, tiltDelta: tilt) },
+                onRecenter: { model.centerPanTilt() }
+            )
+            .frame(height: panelHeight < 600 ? 150 : 196)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
 
             statusRow
 
@@ -140,6 +149,12 @@ struct PanelView: View {
         model.control("exposure-auto")?.current == 8
     }
 
+    private var panTiltSpan: Int {
+        guard let pan = model.control("pan"), let minValue = pan.min, let maxValue = pan.max,
+              maxValue > minValue else { return 72000 }
+        return maxValue - minValue
+    }
+
     private var exposureSection: some View {
         section("Exposure", symbol: "camera.aperture") {
             Picker("", selection: intBinding("exposure-auto", normalize: { $0 == 8 ? 8 : 1 })) {
@@ -190,7 +205,23 @@ struct PanelView: View {
             ) { model.setControl("focus", to: $0) }
             if model.zoomAvailable {
                 ControlSliderRow(control: model.control("zoom")) { model.setControl("zoom", to: $0) }
-                Text("Zoom is an ISP crop; it only applies at 1280x720 and below.")
+                if model.panTiltAvailable {
+                    HStack {
+                        Text("Track my face")
+                            .font(.system(size: 12))
+                        Spacer()
+                        Toggle("", isOn: Binding(
+                            get: { model.faceTrackingEnabled },
+                            set: { model.setFaceTracking($0) }
+                        ))
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .labelsHidden()
+                    }
+                }
+                Text(model.panTiltAvailable
+                     ? "Drag the preview to pan and tilt. Double-click it to recenter."
+                     : "Zoom is an ISP crop; it only applies at 1280x720 and below.")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
             }
@@ -371,18 +402,47 @@ private struct ControlSliderRow: View {
 
 struct CameraPreviewView: NSViewRepresentable {
     let controller: PreviewSessionController
+    var panTiltEnabled = false
+    var panQuantum = 150
+    var panSpan = 72000
+    var onPanTiltDelta: ((Int, Int) -> Void)?
+    var onRecenter: (() -> Void)?
 
     func makeNSView(context: Context) -> PreviewNSView {
         PreviewNSView(controller: controller)
     }
 
-    func updateNSView(_ nsView: PreviewNSView, context: Context) {}
+    func updateNSView(_ nsView: PreviewNSView, context: Context) {
+        nsView.panTiltEnabled = panTiltEnabled
+        nsView.panQuantum = panQuantum
+        nsView.panSpan = panSpan
+        nsView.onPanTiltDelta = onPanTiltDelta
+        nsView.onRecenter = onRecenter
+    }
 }
 
 @MainActor
 final class PreviewNSView: NSView {
     private let controller: PreviewSessionController
     private let previewLayer = AVCaptureVideoPreviewLayer()
+
+    var panTiltEnabled = false {
+        didSet {
+            if panTiltEnabled != oldValue {
+                window?.invalidateCursorRects(for: self)
+            }
+        }
+    }
+    var panQuantum = 150
+    var panSpan = 72000
+    var onPanTiltDelta: ((Int, Int) -> Void)?
+    var onRecenter: (() -> Void)?
+
+    /// Sub-quantum drag distance carried between mouse events so slow drags
+    /// still accumulate into emitted deltas.
+    private var pendingPan = 0.0
+    private var pendingTilt = 0.0
+    private var dragCursorPushed = false
 
     init(controller: PreviewSessionController) {
         self.controller = controller
@@ -410,5 +470,53 @@ final class PreviewNSView: NSView {
         } else {
             controller.start()
         }
+    }
+
+    // MARK: - Drag to pan/tilt
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if panTiltEnabled {
+            addCursorRect(bounds, cursor: .openHand)
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard panTiltEnabled else { return super.mouseDown(with: event) }
+        if event.clickCount == 2 {
+            onRecenter?()
+            return
+        }
+        pendingPan = 0
+        pendingTilt = 0
+        NSCursor.closedHand.push()
+        dragCursorPushed = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if dragCursorPushed {
+            NSCursor.pop()
+            dragCursorPushed = false
+        }
+        super.mouseUp(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard panTiltEnabled, bounds.width > 0 else { return }
+
+        // Dragging across the full preview sweeps the full pan range; the
+        // image content follows the cursor like dragging a map. Hardware
+        // tilt is positive-down, hence the shared sign on both axes.
+        let unitsPerPoint = Double(panSpan) / Double(bounds.width)
+        pendingPan += -event.deltaX * unitsPerPoint
+        pendingTilt += -event.deltaY * unitsPerPoint
+
+        let step = Double(max(panQuantum, 1))
+        let panSteps = (pendingPan / step).rounded(.towardZero)
+        let tiltSteps = (pendingTilt / step).rounded(.towardZero)
+        guard panSteps != 0 || tiltSteps != 0 else { return }
+        pendingPan -= panSteps * step
+        pendingTilt -= tiltSteps * step
+        onPanTiltDelta?(Int(panSteps) * panQuantum, Int(tiltSteps) * panQuantum)
     }
 }

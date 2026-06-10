@@ -14,6 +14,28 @@ Inspect the camera:
 ./onncam/onncam list
 ```
 
+Discover everything the hardware exposes (all UVC selectors, the Sonix
+extension unit, the UAC microphone topology, and any HID interfaces):
+
+```sh
+./onncam/onncam probe
+```
+
+Probe findings for the onn 4K Webcam (3938:1390):
+
+- `mirror` (UVC roll, 0–3): flip/mirror states; matches the hidden slider in
+  the vendor's Windows app.
+- `pan` / `tilt` (±36000, step 3600): digital pan within the zoom crop.
+- `privacy` (0/1) and `ae-priority` (0/1) also work.
+- The Sonix extension unit (id 3, GUID 28f03370-6311-4a2e-ba2c-6890eb334016)
+  answers selectors 0x01–0x06, 0x18, 0x19. The Windows app's "Filters"
+  presets live there (sensor/I2C register access) — payloads undecoded; do
+  not write to it blind.
+- Microphone: UAC 1.0, stereo. Feature unit has only master mute and
+  per-channel volume (−95..0 dB, default 0 dB = already max). No AGC, EQ, or
+  boost, and no vendor HID interface — there is nothing to tune over USB.
+
+
 Set common UVC controls:
 
 ```sh
